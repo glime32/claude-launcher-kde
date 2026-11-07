@@ -1,0 +1,497 @@
+#!/usr/bin/env python3
+"""Sélecteur de conversations Claude Code (lancé depuis le menu KDE).
+
+Entrée        : reprendre la conversation choisie
+Ctrl-N        : nouvelle conversation (demande un titre)
+Taper un titre qui ne correspond à rien + Entrée : nouvelle conversation avec ce titre
+Échap         : quitter
+"""
+import datetime as dt
+import glob
+import json
+import re
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import textwrap
+import threading
+import time
+import uuid
+from pathlib import Path
+
+# claude-window ajoute un dossier de réglages Konsole à XDG_CONFIG_DIRS :
+# on remet la valeur d'origine pour tout ce qui est lancé d'ici (fzf, Claude…)
+if "CLAUDE_ORIG_XDG_CONFIG_DIRS" in os.environ:
+    _orig = os.environ.pop("CLAUDE_ORIG_XDG_CONFIG_DIRS")
+    if _orig:
+        os.environ["XDG_CONFIG_DIRS"] = _orig
+    else:
+        os.environ.pop("XDG_CONFIG_DIRS", None)
+
+HOME = Path.home()
+PROJECTS = HOME / ".claude" / "projects"
+CLAUDE = shutil.which("claude") or str(HOME / ".local/bin/claude")
+NEW_ID = "__new__"
+COLOR = os.environ.get("CLAUDE_FRAME_COLOR", "")
+LOG = Path(os.environ.get("XDG_STATE_HOME") or HOME / ".local/state") / "claude-launcher.log"
+
+
+def log(msg: str) -> None:
+    """Journal horodaté (sert à comprendre un blocage s'il revient)."""
+    try:
+        if LOG.exists() and LOG.stat().st_size > 200_000:
+            LOG.write_text("".join(LOG.read_text().splitlines(True)[-500:]))
+        with LOG.open("a") as f:
+            f.write(f"{dt.datetime.now():%Y-%m-%d %H:%M:%S.%f}"[:-3] + f" [{os.getpid()}] {msg}\n")
+    except OSError:
+        pass
+
+
+def claude_cmd(*extra: str) -> list[str]:
+    """Commande claude : thème assorti au cadre + animations réduites (moins de processeur)."""
+    settings = {"prefersReducedMotion": True}
+    if COLOR and (HOME / f".claude/themes/claude-{COLOR}.json").exists():
+        settings["theme"] = f"custom:claude-{COLOR}"
+    return [CLAUDE, *extra, "--settings", json.dumps(settings)]
+
+
+def _titles_in(chunk: bytes) -> tuple[str | None, str | None]:
+    custom = ai = None
+    for line in chunk.splitlines():
+        if b'"custom-title"' in line or b'"ai-title"' in line:
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if r.get("type") == "custom-title" and r.get("customTitle"):
+                custom = r["customTitle"]
+            elif r.get("type") == "ai-title" and r.get("aiTitle"):
+                ai = r["aiTitle"]
+    return custom, ai
+
+
+def watch_title(find_path, current: str, has_custom: bool) -> None:
+    """Tient le titre de la barre à jour (titre automatique de Claude, /rename).
+    Ne lit que ce qui a été ajouté au fichier de la conversation depuis la dernière fois."""
+    pos = None
+    while True:
+        time.sleep(3)
+        try:
+            p = find_path()
+            if p is None:
+                continue
+            size = p.stat().st_size
+            if pos is None or size < pos:
+                pos = max(0, size - 512_000)
+            if size == pos:
+                continue
+            with p.open("rb") as f:
+                f.seek(pos)
+                chunk = f.read(size - pos)
+            nl = chunk.rfind(b"\n")
+            if nl < 0:
+                continue
+            pos += nl + 1
+            custom, ai = _titles_in(chunk[:nl + 1])
+            new = custom or (ai if not has_custom else None)
+            has_custom = has_custom or bool(custom)
+            if new and new != current:
+                current = new
+                set_title(new)
+                log(f"titre mis à jour : {new!r}")
+        except OSError:
+            continue
+
+
+def launch(cwd: Path, args: list[str], watch: tuple | None = None) -> None:
+    """Lance Claude et reste derrière lui : s'il est suspendu (Ctrl+Z), il est
+    relancé aussitôt, car dans cette fenêtre il n'y a pas de shell pour faire `fg`.
+    Le titre de la barre est géré ici (Claude ne le touche plus)."""
+    os.chdir(cwd)
+    log(f"lancement dans {cwd} : {args[1:]}")
+    os.environ["CLAUDE_CODE_DISABLE_TERMINAL_TITLE"] = "1"
+    sys.stdout.flush()
+    # Comme un vrai shell : Claude dans son propre groupe, au premier plan du terminal.
+    # Sans ça, Linux ignore sa demande de pause et Claude reste bloqué en « suspendu ».
+    pid = os.fork()
+    if pid == 0:
+        os.setpgid(0, 0)
+        signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+        try:
+            os.tcsetpgrp(0, os.getpgrp())
+        except OSError:
+            pass
+        signal.signal(signal.SIGTTOU, signal.SIG_DFL)
+        os.execv(CLAUDE, args)
+    try:
+        os.setpgid(pid, pid)
+    except OSError:
+        pass
+    for s in (signal.SIGINT, signal.SIGQUIT, signal.SIGTSTP):
+        signal.signal(s, lambda *_: None)  # le menu ne doit ni s'arrêter ni mourir
+    signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+    if watch:
+        threading.Thread(target=watch_title, args=watch, daemon=True).start()
+    while True:
+        _, status = os.waitpid(pid, os.WUNTRACED)
+        if os.WIFSTOPPED(status):
+            log("Claude suspendu (Ctrl+Z) : reprise automatique")
+            time.sleep(0.2)
+            try:
+                os.tcsetpgrp(0, pid)  # lui rendre le clavier, au cas où
+            except OSError:
+                pass
+            os.killpg(pid, signal.SIGCONT)
+            continue
+        code = os.waitstatus_to_exitcode(status)
+        log(f"Claude terminé (code {code})")
+        sys.exit(code if code >= 0 else 1)
+
+
+def read_session(path: Path) -> dict | None:
+    info = {"id": path.stem, "file": path, "custom": None, "ai": None,
+            "summary": None, "last": None, "first": None, "cwd": None, "msgs": 0}
+    try:
+        with path.open(encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                t = r.get("type")
+                if t == "custom-title" and r.get("customTitle"):
+                    info["custom"] = r["customTitle"]
+                elif t == "ai-title" and r.get("aiTitle"):
+                    info["ai"] = r["aiTitle"]
+                elif t == "summary" and r.get("summary"):
+                    info["summary"] = r["summary"]
+                elif t == "last-prompt" and r.get("lastPrompt"):
+                    info["last"] = r["lastPrompt"]
+                elif t in ("user", "assistant") and not r.get("isMeta"):
+                    info["msgs"] += 1
+                    if info["cwd"] is None and r.get("cwd"):
+                        info["cwd"] = r["cwd"]
+                    if t == "user" and info["first"] is None:
+                        c = r.get("message", {}).get("content")
+                        if isinstance(c, list):
+                            c = " ".join(x.get("text", "") for x in c
+                                         if isinstance(x, dict) and x.get("type") == "text")
+                        if isinstance(c, str) and not re.match(
+                                r"\s*<(command|local-command|system)", c):
+                            c = re.sub(r"<[^>]+>", " ", c).strip()
+                            if c:
+                                info["first"] = c
+    except OSError:
+        return None
+    # sessions vides ou ne contenant que des commandes (/mcp, /chrome…) : on masque
+    if info["msgs"] == 0 or not (info["custom"] or info["ai"] or info["summary"] or info["first"]):
+        return None
+    info["mtime"] = path.stat().st_mtime
+    first_line = lambda s: s.strip().splitlines()[0] if s and s.strip() else None
+    info["title"] = (info["custom"] or info["ai"] or info["summary"]
+                     or first_line(info["first"]) or first_line(info["last"])
+                     or "(sans titre)")
+    return info
+
+
+def all_sessions() -> list[dict]:
+    out = []
+    for p in PROJECTS.glob("*/*.jsonl"):
+        s = read_session(p)
+        if s:
+            out.append(s)
+    out.sort(key=lambda s: s["mtime"], reverse=True)
+    return out
+
+
+def when(ts: float) -> str:
+    d = dt.datetime.fromtimestamp(ts)
+    today = dt.date.today()
+    if d.date() == today:
+        day = "aujourd'hui"
+    elif d.date() == today - dt.timedelta(days=1):
+        day = "hier"
+    else:
+        day = d.strftime("%d/%m")
+    return f"{day} {d:%H:%M}"
+
+
+def short_dir(cwd: str | None) -> str:
+    if not cwd:
+        return ""
+    p = Path(cwd)
+    try:
+        rel = p.relative_to(HOME)
+        return "~" if str(rel) == "." else f"~/{rel}"
+    except ValueError:
+        return cwd
+
+
+# Couleurs ANSI (violet comme le thème du bureau)
+# Couleur d'accent = couleur du cadre de la fenêtre (choisie par claude-window)
+#            accent     clair      fond ligne choisie
+def _frame_rgb() -> tuple[int, int, int]:
+    try:
+        r, g, b = (int(x) for x in os.environ.get("CLAUDE_FRAME_RGB", "").split(","))
+        return r, g, b
+    except ValueError:
+        return 139, 92, 246  # violet par défaut
+
+
+def _mix(c, other, t):
+    return tuple(round(a * (1 - t) + b * t) for a, b in zip(c, other))
+
+
+_C = _frame_rgb()
+_hex = lambda c: "#%02x%02x%02x" % tuple(c)
+ACCENT, LIGHT, SELBG = _hex(_C), _hex(_mix(_C, (255, 255, 255), 0.45)), _hex(_mix(_C, (0, 0, 0), 0.75))
+
+
+def set_title(title: str) -> None:
+    """Titre affiché dans la barre colorée de la fenêtre."""
+    title = re.sub(r"[\x00-\x1f\x7f]", " ", title)[:80]
+    sys.stdout.write(f"\033]2;{title}\007")
+    sys.stdout.flush()
+
+
+def _ansi(hexcol: str) -> str:
+    r, g, b = (int(hexcol[i:i + 2], 16) for i in (1, 3, 5))
+    return f"\033[38;2;{r};{g};{b}m"
+
+
+V, G, B, R = _ansi(LIGHT), "\033[38;5;245m", "\033[1m", "\033[0m"
+
+
+def preview(session_id: str) -> None:
+    if session_id == NEW_ID:
+        print(f"{B}{V}Nouvelle conversation{R}\n")
+        width = max(30, int(os.environ.get("FZF_PREVIEW_COLUMNS", 60)) - 2)
+        for para in ("Entrée → tu donnes un titre, puis le dossier (vide = ~, Tab pour compléter), et Claude Code s'ouvre.",
+                     "Astuce : tape directement le titre dans la recherche. S'il ne correspond à aucune conversation, Entrée la crée avec ce titre."):
+            print(textwrap.fill(para, width) + "\n")
+        return
+    for p in PROJECTS.glob(f"*/{session_id}.jsonl"):
+        s = read_session(p)
+        if not s:
+            continue
+        print(f"{B}{V}{s['title']}{R}\n")
+        print(f"{G}Dossier  :{R} {short_dir(s['cwd'])}")
+        print(f"{G}Activité :{R} {when(s['mtime'])}")
+        print(f"{G}Messages :{R} {s['msgs']}")
+        if s["custom"] and s["ai"] and s["ai"] != s["custom"]:
+            print(f"{G}Résumé   :{R} {s['ai']}")
+        width = max(30, int(os.environ.get("FZF_PREVIEW_COLUMNS", 60)) - 2)
+        for label, txt in (("Premier message", s["first"]), ("Dernier message", s["last"])):
+            if txt:
+                print(f"\n{G}{label} :{R}")
+                print(textwrap.fill(" ".join(txt.split())[:500], width))
+        return
+
+
+def _rl(prompt: str) -> str:
+    """Entoure les codes couleur pour que readline calcule bien la largeur."""
+    return re.sub(r"(\033\[[0-9;]*m)", "\001\\1\002", prompt)
+
+
+def _ask(prompt: str) -> str:
+    log("question : " + re.sub(r"\033\[[0-9;]*m", "", prompt).split("(")[0].strip())
+    try:
+        r = input(_rl(prompt)).strip()
+        log(f"réponse : {r!r}")
+        return r
+    except (EOFError, KeyboardInterrupt):
+        log("annulé")
+        sys.exit(0)
+
+
+def _complete_dir(text: str, state: int):
+    base = os.path.expanduser(text)
+    if base and not os.path.isabs(base):
+        base = str(HOME / base)
+    found = sorted(d for d in glob.glob(glob.escape(base) + "*") if os.path.isdir(d))
+    shown = []
+    for d in found:
+        if text.startswith("~"):
+            d = "~" + d[len(str(HOME)):]
+        elif not os.path.isabs(text):
+            d = os.path.relpath(d, HOME)
+        shown.append(d + "/")
+    return shown[state] if state < len(shown) else None
+
+
+def ask_dir() -> Path:
+    import readline  # chargé seulement ici (inutile pour le menu et les aperçus)
+    readline.set_completer_delims("\t\n")
+    readline.set_completer(_complete_dir)
+    readline.parse_and_bind("tab: complete")
+    while True:
+        raw = _ask(f"Dossier {G}(Entrée = ~ · Tab pour compléter){R} : ")
+        if not raw:
+            return HOME
+        d = Path(os.path.expanduser(raw))
+        if not d.is_absolute():
+            d = HOME / d
+        if d.is_dir():
+            return d.resolve()
+        if d.exists():
+            print(f"{d} n'est pas un dossier.")
+            continue
+        if _ask(f"{d} n'existe pas. Le créer ? (o/N) ").lower() in ("o", "oui", "y", "yes"):
+            d.mkdir(parents=True)
+            return d
+    
+
+def new_session(title: str | None = None) -> None:
+    import readline  # édition de ligne (flèches, Tab) pour les questions
+    log("nouvelle conversation")
+    print(f"{B}{V}Nouvelle conversation{R}\n", flush=True)
+    readline.set_completer(None)
+    if title is None:
+        title = _ask(f"Titre   {G}(Entrée = titre automatique){R} : ")
+    else:
+        print(f"Titre   : {title}")
+    cwd = ask_dir()
+    sid = str(uuid.uuid4())  # connu d'avance : permet de suivre le titre de la conversation
+    shown = title or "Nouvelle conversation"
+    set_title(shown)
+    launch(cwd, claude_cmd("--session-id", sid, *(["-n", title] if title else [])),
+           watch=(lambda: next(iter(PROJECTS.glob(f"*/{sid}.jsonl")), None), shown, bool(title)))
+
+
+SYNC = (b"\x1b[?2026h", b"\x1b[?2026l")
+
+
+def _strip_sync(data: bytes, carry: bytes) -> tuple[bytes, bytes]:
+    """Retire les ordres « mise à jour synchronisée » (Konsole s'y fige) ; garde un
+    début de séquence coupé en fin de bloc pour le recoller au bloc suivant."""
+    data = carry + data
+    for s in SYNC:
+        data = data.replace(s, b"")
+    keep = b""
+    for k in range(min(7, len(data)), 0, -1):
+        if any(s.startswith(data[-k:]) for s in SYNC):
+            keep = data[-k:]
+            break
+    return (data[:-len(keep)] if keep else data), keep
+
+
+def run_fzf(cmd: list[str], text: str) -> tuple[int, str]:
+    """Lance fzf dans un petit terminal intermédiaire et recopie son affichage vers
+    Konsole. Sans ça, Konsole fige parfois l'écran (fenêtre vide jusqu'à une touche)."""
+    import fcntl, pty, select, termios, tty
+    master, slave = pty.openpty()
+    try:
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, fcntl.ioctl(0, termios.TIOCGWINSZ, b"\0" * 8))
+    except OSError:
+        pass
+
+    def child_setup():
+        os.setsid()
+        fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=slave,
+                         preexec_fn=child_setup, pass_fds=(slave,))
+    os.close(slave)
+    threading.Thread(target=lambda: (p.stdin.write(text.encode()), p.stdin.close()), daemon=True).start()
+    out_chunks: list[bytes] = []
+    threading.Thread(target=lambda: out_chunks.append(p.stdout.read()), daemon=True).start()
+
+    def resize(*_):
+        try:
+            fcntl.ioctl(master, termios.TIOCSWINSZ, fcntl.ioctl(0, termios.TIOCGWINSZ, b"\0" * 8))
+        except OSError:
+            pass
+
+    old_winch = signal.signal(signal.SIGWINCH, resize)
+    old_tty = termios.tcgetattr(0)
+    tty.setraw(0)
+    carry = b""
+    try:
+        while True:
+            r, _, _ = select.select([0, master], [], [])
+            if master in r:
+                try:
+                    data = os.read(master, 65536)
+                except OSError:
+                    break
+                if not data:
+                    break
+                data, carry = _strip_sync(data, carry)
+                while data:
+                    data = data[os.write(1, data):]
+            if 0 in r:
+                data = os.read(0, 4096)
+                if data:
+                    os.write(master, data)
+    finally:
+        termios.tcsetattr(0, termios.TCSADRAIN, old_tty)
+        signal.signal(signal.SIGWINCH, old_winch)
+        os.close(master)
+    code = p.wait()
+    for _ in range(50):  # laisse le fil de lecture finir
+        if out_chunks:
+            break
+        time.sleep(0.01)
+    return code, (out_chunks[0] if out_chunks else b"").decode("utf-8", "replace")
+
+
+def main() -> None:
+    if len(sys.argv) == 3 and sys.argv[1] == "--preview":
+        preview(sys.argv[2])
+        return
+
+    log(f"démarrage (cadre {COLOR or '?'})")
+    set_title("Claude Code")
+    sessions = all_sessions()
+    log(f"{len(sessions)} conversations lues")
+    rows = [f"{NEW_ID}\t{B}{V}＋ Nouvelle conversation{R}"]
+    for s in sessions:
+        d = short_dir(s["cwd"])
+        where = f"  {G}{d}{R}" if d and d != "~" else ""
+        rows.append(f"{s['id']}\t{G}{when(s['mtime']):>17}{R}  {s['title']}{where}")
+
+    me = os.path.abspath(__file__)
+    cmd = [
+        "fzf", "--ansi", "--delimiter=\t", "--with-nth=2..", "--nth=2..",
+        "--layout=reverse", "--height=100%", "--border=none",
+        "--prompt=Rechercher › ",
+        "--header=Entrée : ouvrir · Ctrl-N : nouvelle · Échap : quitter",
+        "--print-query", "--expect=ctrl-n",
+        "--bind=enter:accept-or-print-query",
+        "--with-shell=sh -c",  # aperçus via sh : plus rapide que fish
+        f"--preview={sys.executable} {me} --preview {{1}}",
+        "--preview-window=right,45%,wrap,border-left",
+        f"--color=fg+:#ffffff,bg+:{SELBG},hl:{LIGHT},hl+:{LIGHT},pointer:{ACCENT},"
+        f"prompt:{LIGHT},border:{ACCENT},label:{LIGHT},header:#8a8a8a,info:{ACCENT},"
+        f"preview-border:{ACCENT}",
+    ]
+    log("menu affiché")
+    code, out = run_fzf(cmd, "\n".join(rows))
+    lines = out.split("\n")
+    query = lines[0].strip() if lines else ""
+    key = lines[1] if len(lines) > 1 else ""
+    choice = lines[2] if len(lines) > 2 else ""
+    log(f"menu fermé (code {code}, touche {key or 'Entrée'}, choix {choice.split(chr(9))[0] or '-'})")
+    if code not in (0, 1):  # Échap / Ctrl-C
+        return
+    # écran propre et forcé à se redessiner avant la suite
+    sys.stdout.write("\033[0m\033[H\033[2J")
+    sys.stdout.flush()
+
+    if key == "ctrl-n" or not choice:  # Ctrl-N, ou la recherche ne correspond à rien
+        new_session(query or None)
+    else:
+        sid = choice.split("\t", 1)[0]
+        if sid == NEW_ID:
+            new_session()
+        s = next(x for x in sessions if x["id"] == sid)
+        cwd = Path(s["cwd"]) if s["cwd"] and Path(s["cwd"]).is_dir() else HOME
+        set_title(s["title"])
+        launch(cwd, claude_cmd("--resume", sid),
+               watch=(lambda: s["file"], s["title"], bool(s["custom"])))
+
+
+if __name__ == "__main__":
+    main()
