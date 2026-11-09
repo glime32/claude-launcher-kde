@@ -1,4 +1,4 @@
-# nom r,g,b [luminosité du cadre inactif en %, 75 par défaut]
+# nom r,g,b  (8 couleurs au plus, une fenêtre par couleur)
 bleu 59,130,246
 violet 139,92,246
 orange 217,119,87

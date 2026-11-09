@@ -1,0 +1,18 @@
+[package]
+name = "claude-launcher"
+version = "0.2.0"
+license = "MIT"
+edition = "2024"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+libc = "0.2"
+rustyline = { version = "19", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
