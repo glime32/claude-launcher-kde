@@ -4,11 +4,12 @@
 //!   claude-window --libre C        exit 0 if color C is free, 1 if taken
 //!   claude-window --couleur C      C if it is free (else the first free one)
 //!   claude-window --reprendre ID   open conversation ID directly, without the menu
+//!   claude-window --reprise        at login: reopen every window a crash or a shutdown closed
 //!
 //! The color is reserved in $XDG_RUNTIME_DIR/claude-couleurs/<color> (our pid, which
 //! becomes Konsole's through exec).
 
-use claude_launcher::{Paths, color_taken, hex, palette, which};
+use claude_launcher::{Paths, color_taken, detach, forget_window, hex, index, log_line, palette, recorded_windows, which};
 use std::env;
 use std::fs::{self, File};
 use std::io;
@@ -43,6 +44,23 @@ fn copy_binary(src: &Path, dest: &Path) -> io::Result<()> {
     fs::rename(&tmp, dest)
 }
 
+fn reopen(paths: &Paths) {
+    let Ok(me) = env::current_exe() else { return };
+    for (color, session, state) in recorded_windows(paths) {
+        if color_taken(paths, &color) {
+            continue; // still open
+        }
+        forget_window(paths, &color);
+        if index::session_file(paths, &session).is_none() {
+            continue; // conversation never started or deleted
+        }
+        log_line(paths, &format!("reprise après coupure : {session} ({color}, {state})"));
+        let _ = detach(Command::new(&me).args(["--couleur", &color, "--reprendre", &session]))
+            .env("CLAUDE_REPRISE_ETAT", &state)
+            .spawn();
+    }
+}
+
 fn main() {
     let paths = Paths::new();
     let _ = fs::create_dir_all(&paths.run);
@@ -55,6 +73,10 @@ fn main() {
             "--libre" => exit(if color_taken(&paths, value.as_deref().unwrap_or("")) { 1 } else { 0 }),
             "--couleur" => wanted = value,
             "--reprendre" => resume = value,
+            "--reprise" => {
+                reopen(&paths);
+                exit(0);
+            }
             _ => {
                 i += 1;
                 continue;

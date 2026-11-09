@@ -20,8 +20,9 @@ qdbus6 org.kde.KWin /KWin reconfigure 2>/dev/null || true
 for b in claude-launcher claude-window claude-menu claude-hook claude-focus claude-couleurs; do
   rm -f "$HOME/.local/bin/$b"
 done
-rm -f "$HOME/.local/share/applications/claude-code.desktop" "$conf/couleurs" "$conf/defaults/konsolerc"
-rm -rf "$HOME/.cache/claude-launcher"
+rm -f "$HOME/.local/share/applications/claude-code.desktop" "$conf/couleurs" "$conf/defaults/konsolerc" \
+      "$HOME/.config/autostart/claude-reprise.desktop"
+rm -rf "$HOME/.cache/claude-launcher" "$HOME/.local/state/claude-window/fenetres"
 rmdir "$conf/defaults" "$conf" 2>/dev/null
 kbuildsycoca6 >/dev/null 2>&1
 echo "Désinstallé. Restent tes épingles et la mémoire des couleurs dans ~/.local/state/claude-window/."

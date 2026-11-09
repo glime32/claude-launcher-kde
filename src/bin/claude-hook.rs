@@ -6,12 +6,15 @@
 //! isn't the one you are looking at. Must never print anything: Claude would add it
 //! to the conversation.
 
-use claude_launcher::{Paths, detach, focus, read_trim};
+use claude_launcher::{Paths, detach, focus, read_trim, record_window};
 use serde_json::{Value, json};
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 fn run(cmd: &str, args: &[&str]) -> String {
     Command::new(cmd)
@@ -66,19 +69,58 @@ fn push(paths: &Paths, title: &str, body: &str, done: bool) {
     }
 }
 
+/// How long the « Afficher » button keeps working. Plasma never closes a notification
+/// that went into the history, so `notify-send -w` would otherwise stay alive with this
+/// process (≈ 11 MB together) until it is closed by hand. Past this delay notify-send is
+/// killed: the notification stays in the history, its button just does nothing anymore.
+const CLICK_WAIT: Duration = Duration::from_secs(120);
+
 /// Desktop notification; its « Afficher » button raises the window. Runs detached so
 /// Claude doesn't wait for the click.
 fn notifier(paths: &Paths, args: &[String]) {
     let [title, body, konsole] = args else { return };
     let icon = paths.icons.join("claude-code.png");
-    let out = Command::new("notify-send")
+    let Ok(mut child) = Command::new("notify-send")
         .args(["-a", "Claude Code", "-i"])
         .arg(icon)
         .args(["-A", "afficher=Afficher", "-w", "--", title, body])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output();
-    if out.is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "afficher") && !konsole.is_empty() {
+        .spawn()
+    else {
+        return;
+    };
+    let Some(mut stdout) = child.stdout.take() else { return };
+    // read in a thread so the wait can give up: no polling while the notification is up
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut out = String::new();
+        let _ = stdout.read_to_string(&mut out);
+        let _ = tx.send(out);
+    });
+    let clicked = match rx.recv_timeout(CLICK_WAIT) {
+        Ok(out) => out.trim() == "afficher",
+        Err(_) => {
+            let _ = child.kill();
+            false
+        }
+    };
+    let _ = child.wait();
+    if clicked && !konsole.is_empty() {
         focus(paths, konsole);
+    }
+}
+
+/// Same state on disk, for windows opened by a launcher that cleans it up when the window
+/// is closed by hand (CLAUDE_REPRISE=1): after a crash or a shutdown, claude-window
+/// --reprise reopens them.
+fn remember(paths: &Paths, color: &str, state: &str) {
+    if env::var("CLAUDE_REPRISE").as_deref() != Ok("1") {
+        return;
+    }
+    if let Some(session) = read_trim(paths.run_file(color, ".session")).filter(|s| !s.is_empty()) {
+        record_window(paths, color, &session, state);
     }
 }
 
@@ -99,6 +141,7 @@ fn main() {
     if state == "travail" {
         if read_trim(&state_file).as_deref() != Some("travail") {
             let _ = fs::write(&state_file, "travail\n");
+            remember(&paths, &color, "travail");
         }
         return;
     }
@@ -110,6 +153,7 @@ fn main() {
         return;
     }
     let _ = fs::write(&state_file, format!("{state}\n"));
+    remember(&paths, &color, state);
 
     let name = read_trim(paths.run_file(&color, ".titre")).filter(|t| !t.is_empty());
     let name = name.as_deref().unwrap_or("Claude Code");

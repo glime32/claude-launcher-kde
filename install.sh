@@ -42,6 +42,17 @@ Keywords=claude;ai;ia;code;assistant;
 StartupNotify=false
 X-KDE-Shortcuts=Meta+C
 DESK
+# à l'ouverture de session : rouvre les fenêtres qu'un plantage ou un arrêt a fermées
+mkdir -p "$HOME/.config/autostart"
+cat > "$HOME/.config/autostart/claude-reprise.desktop" <<DESK
+[Desktop Entry]
+Type=Application
+Name=Claude Code : reprise après coupure
+Comment=Rouvre les fenêtres Claude qu'un plantage ou un arrêt a fermées
+Exec=$bin/claude-window --reprise
+Icon=$icon
+Terminal=false
+DESK
 update-desktop-database -q "$HOME/.local/share/applications" 2>/dev/null || true
 kbuildsycoca6 >/dev/null 2>&1 || true
 

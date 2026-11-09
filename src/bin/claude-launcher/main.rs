@@ -9,7 +9,8 @@ mod pty;
 use ask::{Prompter, expand};
 use claude_launcher::index::{self, Session};
 use claude_launcher::{
-    BLACK, BOLD, GREY, NEW_ID, Paths, RESET, Rgb, WHITE, color_taken, detach, fg, focus, frame_rgb, hex, log_line,
+    BLACK, BOLD, GREY, NEW_ID, Paths, RESET, Rgb, WHITE, color_taken, detach, fg, focus, forget_window, frame_rgb, hex,
+    log_line, record_window,
     menu, mix, open_windows, short_dir, which,
 };
 use serde_json::{Map, Value, json};
@@ -18,10 +19,11 @@ use std::ffi::CString;
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, exit};
+use std::process::{Command, Stdio, exit};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread::{self, sleep};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 struct Ctx {
     paths: Paths,
@@ -29,6 +31,8 @@ struct Ctx {
     accent: Rgb,
     light: Rgb,
     selbg: Rgb,
+    /// state a reopened window had before the crash, kept until something new happens
+    resumed_state: String,
 }
 
 static CTX: OnceLock<Ctx> = OnceLock::new();
@@ -42,6 +46,7 @@ fn ctx() -> &'static Ctx {
             accent: c,
             light: mix(c, WHITE, 0.45),
             selbg: mix(c, BLACK, 0.75),
+            resumed_state: env::var("CLAUDE_REPRISE_ETAT").unwrap_or_default(),
         }
     })
 }
@@ -126,7 +131,64 @@ fn mark_session(sid: &str) {
     let c = ctx();
     if !c.color.is_empty() {
         let _ = fs::write(c.paths.run_file(&c.color, ".session"), sid);
+        record_window(&c.paths, &c.color, sid, &c.resumed_state);
     }
+}
+
+static HUNG_UP: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_hangup(_: libc::c_int) {
+    HUNG_UP.store(true, Ordering::Relaxed);
+}
+
+/// Logout, shutdown, or the session already gone.
+fn session_ending() -> bool {
+    let output = |cmd: &str, args: &[&str]| {
+        let out = Command::new(cmd).args(args).stderr(Stdio::null()).output().ok()?;
+        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    let ksmserver = output("qdbus6", &["org.kde.ksmserver", "/KSMServer", "org.kde.KSMServerInterface.isShuttingDown"]);
+    ksmserver.is_none_or(|v| v == "true") || output("systemctl", &["is-system-running"]).is_some_and(|v| v == "stopping")
+}
+
+fn terminal_alive() -> bool {
+    let mut t: libc::termios = unsafe { std::mem::zeroed() };
+    unsafe { libc::tcgetattr(0, &mut t) == 0 }
+}
+
+/// Quitting Claude or closing the window by hand forgets it; a window closed by a logout
+/// or a shutdown stays recorded, and the next login reopens it (claude-window --reprise).
+fn finish(code: i32) -> ! {
+    let c = ctx();
+    if !c.color.is_empty() {
+        let closed = HUNG_UP.load(Ordering::Relaxed) || !terminal_alive();
+        if closed && session_ending() {
+            log("fenêtre fermée par la fin de session : elle sera rouverte");
+        } else {
+            forget_window(&c.paths, &c.color);
+        }
+    }
+    exit(code)
+}
+
+/// The window is gone. Had we died, the kernel would have sent SIGHUP to Claude.
+fn hang_up(pid: libc::pid_t) -> ! {
+    log("fenêtre fermée");
+    unsafe {
+        libc::killpg(pid, libc::SIGHUP);
+        libc::killpg(pid, libc::SIGCONT);
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut status = 0;
+    while unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } == 0 {
+        if Instant::now() > deadline {
+            unsafe { libc::killpg(pid, libc::SIGKILL) };
+            unsafe { libc::waitpid(pid, &mut status, 0) };
+            break;
+        }
+        sleep(Duration::from_millis(100));
+    }
+    finish(1)
 }
 
 /// Matching theme, reduced motion (less CPU), and the hooks that feed the title bar.
@@ -224,6 +286,11 @@ fn launch(cwd: &Path, args: Vec<String>, watch: Watch) -> ! {
     unsafe {
         env::set_var("CLAUDE_CODE_DISABLE_TERMINAL_TITLE", "1");
         env::set_var("CLAUDE_KONSOLE_PID", libc::getppid().to_string()); // tells claude-hook if the window has focus
+        env::set_var("CLAUDE_REPRISE", "1"); // claude-hook may record this window, finish() cleans up
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = on_hangup as *const () as usize;
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(libc::SIGHUP, &sa, std::ptr::null_mut()); // no SA_RESTART: waitpid returns
     }
     let _ = io::stdout().flush();
     let cargs: Vec<CString> = args.iter().filter_map(|a| CString::new(a.as_str()).ok()).collect();
@@ -252,14 +319,25 @@ fn launch(cwd: &Path, args: Vec<String>, watch: Watch) -> ! {
             libc::signal(s, libc::SIG_IGN);
         }
     }
-    thread::spawn(move || watch_title(watch));
+    // SIGHUP must reach this thread, blocked in waitpid, not the title watcher
+    unsafe {
+        let mut hup: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut hup);
+        libc::sigaddset(&mut hup, libc::SIGHUP);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &hup, std::ptr::null_mut());
+        thread::spawn(move || watch_title(watch));
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &hup, std::ptr::null_mut());
+    }
     loop {
         let mut status = 0;
         if unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) } < 0 {
             if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                if HUNG_UP.load(Ordering::Relaxed) {
+                    hang_up(pid);
+                }
                 continue;
             }
-            exit(1);
+            finish(1);
         }
         if libc::WIFSTOPPED(status) {
             log("Claude suspendu (Ctrl+Z) : reprise automatique");
@@ -272,7 +350,7 @@ fn launch(cwd: &Path, args: Vec<String>, watch: Watch) -> ! {
         }
         let code = if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { -libc::WTERMSIG(status) };
         log(&format!("Claude terminé (code {code})"));
-        exit(if code >= 0 { code } else { 1 });
+        finish(if code >= 0 { code } else { 1 });
     }
 }
 
@@ -456,7 +534,10 @@ fn main() {
     update_bar(Some("Claude Code"), Some(""));
     let direct = env::var("CLAUDE_RESUME_SID").unwrap_or_default();
     // SAFETY: still single-threaded
-    unsafe { env::remove_var("CLAUDE_RESUME_SID") };
+    unsafe {
+        env::remove_var("CLAUDE_RESUME_SID");
+        env::remove_var("CLAUDE_REPRISE_ETAT");
+    }
     if !direct.is_empty()
         && let Some(s) = index::find_session(&c.paths, &direct)
     {

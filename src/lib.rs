@@ -3,8 +3,8 @@ pub mod menu;
 
 use std::collections::HashMap;
 use std::env;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -24,6 +24,7 @@ pub struct Paths {
     pub pins: PathBuf,
     pub color_map: PathBuf,
     pub log: PathBuf,
+    pub windows: PathBuf,
     pub run: PathBuf,
     pub conf: PathBuf,
     pub palette: PathBuf,
@@ -49,6 +50,7 @@ impl Paths {
             pins: state.join("claude-window/epingles.json"),
             color_map: state.join("claude-window/couleurs-conversations.json"),
             log: state.join("claude-launcher.log"),
+            windows: state.join("claude-window/fenetres"),
             run: run.join("claude-couleurs"),
             palette: conf.join("couleurs"),
             bin: home.join(".local/bin"),
@@ -248,4 +250,44 @@ pub fn focus(paths: &Paths, pid: &str) -> bool {
     sleep(Duration::from_millis(300));
     unload();
     true
+}
+
+/// Open windows are also kept on disk, to reopen them after a crash or a shutdown:
+/// ~/.local/state/claude-window/fenetres/<color> holds « session \n state ».
+/// Synced, since a crash is exactly when it matters.
+pub fn record_window(paths: &Paths, color: &str, session: &str, state: &str) {
+    let tmp = paths.windows.join(format!(".{color}.tmp"));
+    let written = (|| -> io::Result<()> {
+        fs::create_dir_all(&paths.windows)?;
+        let mut f = File::create(&tmp)?;
+        f.write_all(format!("{session}\n{state}\n").as_bytes())?;
+        f.sync_all()?;
+        fs::rename(&tmp, paths.windows.join(color))
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+}
+
+pub fn forget_window(paths: &Paths, color: &str) {
+    let _ = fs::remove_file(paths.windows.join(color));
+}
+
+/// (color, session, state) of every recorded window.
+pub fn recorded_windows(paths: &Paths) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    for entry in fs::read_dir(&paths.windows).into_iter().flatten().flatten() {
+        let color = entry.file_name().to_string_lossy().into_owned();
+        if color.starts_with('.') {
+            continue;
+        }
+        let text = fs::read_to_string(entry.path()).unwrap_or_default();
+        let mut lines = text.lines().map(str::trim);
+        let (session, state) = (lines.next().unwrap_or(""), lines.next().unwrap_or(""));
+        if !session.is_empty() {
+            out.push((color, session.to_string(), state.to_string()));
+        }
+    }
+    out.sort();
+    out
 }

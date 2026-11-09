@@ -21,7 +21,8 @@
 - **Une couleur par fenêtre** (8 couleurs : bleu, violet, orange, vert, rose, cyan, jaune, rouge). La barre d'onglet, le cadre, le curseur et le thème de Claude Code prennent cette couleur, et une conversation garde la sienne d'une fois sur l'autre. Les fenêtres inactives sont atténuées. Une 9e fenêtre est refusée avec une notification plutôt que de réutiliser une couleur.
 - **La barre affiche le titre de la conversation** et le suit en direct (titre automatique de Claude, ou `/rename`), précédé de l'état : ⏳ Claude travaille, ✓ à toi, ❗ Claude attend ton accord.
 - **Notification quand Claude a fini** ou attend une permission, seulement si tu ne regardes pas déjà cette fenêtre. Son bouton « Afficher » la ramène. Écran verrouillé : la notification part aussi sur ton téléphone avec [ntfy](https://ntfy.sh), si un topic est réglé dans `~/.config/claude-usage/config.json` (le même que [claude-usage-plasma](https://github.com/glime32/claude-usage-plasma), qui montre aussi une pastille par fenêtre ouverte).
-- **Une entrée par fenêtre dans la barre des tâches**, avec une icône à sa couleur, au lieu de tout ranger sous Konsole.
+- **Une entrée par fenêtre dans la barre des tâches**, au lieu de tout ranger sous Konsole. Son icône est une tuile arrondie à la couleur de la fenêtre, avec la mascotte de Claude Code dessus, dessinée sur des pixels entiers pour rester nette en 32 px.
+- **De retour après un plantage ou un arrêt** : à l'ouverture de session suivante, chaque fenêtre fermée par un plantage, une déconnexion ou un arrêt se rouvre sur la même conversation, dans la même couleur, avec son dernier état (Claude ne repart pas tout seul). Une fenêtre que tu fermes toi-même, ou dont tu quittes Claude, est oubliée.
 - **Ctrl+Z marche** : le lanceur reste derrière Claude et le relance, car il n'y a pas de shell dans la fenêtre pour taper `fg`.
 
 Les fenêtres n'ont pas de barre de titre KDE : déplace-les avec **Meta + glisser**, redimensionne avec **Meta + clic droit glissé**.
@@ -42,10 +43,10 @@ Tout est en Rust (la version 0.1 était en bash et Python) : une petite biblioth
 
 | Binaire | Rôle |
 |---|---|
-| `claude-window` | Prend une couleur libre (verrou + fichier pid par couleur dans `$XDG_RUNTIME_DIR/claude-couleurs/`), ouvre Konsole avec la feuille de style Qt et les réglages de cette couleur. |
+| `claude-window` | Prend une couleur libre (verrou + fichier pid par couleur dans `$XDG_RUNTIME_DIR/claude-couleurs/`), ouvre Konsole avec la feuille de style Qt et les réglages de cette couleur. À l'ouverture de session, `claude-window --reprise` (lancé depuis `~/.config/autostart/`) rouvre les fenêtres notées dans `~/.local/state/claude-window/fenetres/`. |
 | `claude-launcher` | Affiche le menu fzf, puis lance Claude dans son propre groupe de processus, au premier plan du terminal, et le surveille. |
 | `claude-menu` | Tient l'index des conversations et fournit les lignes, l'aperçu et la recherche au menu. |
-| `claude-hook` | Crochet de Claude Code (passé par `--settings`, seulement dans ces fenêtres) : écrit l'état et envoie les notifications. Il n'affiche jamais rien, sinon Claude l'ajouterait à la conversation. |
+| `claude-hook` | Crochet de Claude Code (passé par `--settings`, seulement dans ces fenêtres) : écrit l'état, en garde une copie synchronisée sur le disque pour la réouverture, et envoie les notifications. Il n'affiche jamais rien, sinon Claude l'ajouterait à la conversation. |
 | `claude-focus` | Met une fenêtre au premier plan par son pid (petit script KWin). |
 | `claude-couleurs` | Génère pour chaque couleur la feuille de style Konsole, le thème Claude Code (`~/.claude/themes/`), les icônes, un `.desktop` caché et une règle KWin sans décoration. |
 
@@ -53,7 +54,17 @@ Quelques bizarreries de KDE gérées en route :
 
 - fzf tourne dans son propre pseudo-terminal, sans les séquences de « mise à jour synchronisée » : sinon Konsole figeait parfois la fenêtre toute blanche ;
 - c'est le lanceur qui écrit le titre de la fenêtre, pas Claude ;
-- la barre des tâches de Plasma 6.8 range toute fenêtre dont l'exécutable s'appelle `konsole` sous Konsole, quel que soit son identifiant. `claude-window` lance donc une copie de Konsole nommée `claude-konsole` (dans `~/.cache/claude-launcher/`, recopiée quand Konsole est mis à jour), et chaque fenêtre retrouve son `.desktop` et son icône.
+- la barre des tâches de Plasma 6.8 range toute fenêtre dont l'exécutable s'appelle `konsole` sous Konsole, quel que soit son identifiant. `claude-window` lance donc une copie de Konsole nommée `claude-konsole` (dans `~/.cache/claude-launcher/`, recopiée quand Konsole est mis à jour), et chaque fenêtre retrouve son `.desktop` et son icône ;
+- une fenêtre fermée à la main et une fenêtre fermée par une déconnexion reçoivent toutes les deux un simple SIGHUP. Le lanceur demande à ksmserver (`isShuttingDown`) et à systemd (`stopping`) lequel des deux c'était, et ne garde la fenêtre que dans le second cas ;
+- Plasma ne ferme jamais une notification passée dans son historique, donc `notify-send -w` attendait des heures. Le crochet abandonne au bout de 2 minutes : la notification reste, son bouton « Afficher » ne fait simplement plus rien.
+
+## Tests
+
+```bash
+cargo build --release && python3 tools/test-reprise.py
+```
+
+13 vérifications de la réouverture (plantage, déconnexion, fenêtre fermée à la main, conversation supprimée, fenêtre encore ouverte…) dans un dossier personnel jetable, avec un faux `claude`, un faux KDE et un faux Konsole. Quelques secondes.
 
 ## Désinstaller
 
@@ -61,4 +72,4 @@ Quelques bizarreries de KDE gérées en route :
 ./uninstall.sh
 ```
 
-Tes conversations ne sont pas touchées.
+Tes conversations ne sont pas touchées. La réouverture automatique est retirée aussi.
